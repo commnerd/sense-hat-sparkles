@@ -24,6 +24,10 @@ const FLASH_THRESHOLD: f32 = -20.0; // Threshold for flashing sequence (loud sou
 // Flashing sequence duration
 const FLASH_DURATION: Duration = Duration::from_secs(5);
 
+// Smoothing factor for color transitions (0.0 = no smoothing, 1.0 = no change)
+// Lower values = faster transitions, higher values = slower/smoother transitions
+const COLOR_SMOOTHING: f32 = 0.85;
+
 fn clear_fb(fb: &mut File) -> std::io::Result<()> {
     // Turn all pixels off (black)
     let black_pixel: [u8; 2] = 0u16.to_le_bytes();
@@ -215,10 +219,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     _stream.play()?;
     println!("Audio stream started. Listening to microphone...");
 
-    // Main visualization loop
+    // Main visualization loop with smooth color transitions
     let mut last_flash_time = Instant::now();
     let flash_cooldown = Duration::from_secs(1); // Cooldown after flashing
     let mut last_debug_time = Instant::now();
+    
+    // Current displayed color (for smoothing)
+    let mut current_color = (0u8, 0u8, 0u8);
 
     while running.load(Ordering::SeqCst) {
         let db = f32::from_bits(current_db.load(Ordering::SeqCst));
@@ -234,10 +241,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Flash threshold reached! dB: {:.2}", db);
             flashing_sequence(&mut fb, &running)?;
             last_flash_time = Instant::now(); // Update after flashing completes
+            // Reset current color after flashing
+            current_color = (255, 0, 0);
         } else {
-            // Normal heat map mode
-            let color = db_to_color(db);
-            fill_fb(&mut fb, color)?;
+            // Normal heat map mode with smooth transitions
+            let target_color = db_to_color(db);
+            
+            // Smooth transition from current_color to target_color
+            current_color = (
+                ((current_color.0 as f32 * COLOR_SMOOTHING) + (target_color.0 as f32 * (1.0 - COLOR_SMOOTHING))) as u8,
+                ((current_color.1 as f32 * COLOR_SMOOTHING) + (target_color.1 as f32 * (1.0 - COLOR_SMOOTHING))) as u8,
+                ((current_color.2 as f32 * COLOR_SMOOTHING) + (target_color.2 as f32 * (1.0 - COLOR_SMOOTHING))) as u8,
+            );
+            
+            fill_fb(&mut fb, current_color)?;
         }
 
         // Small delay to avoid excessive writes
