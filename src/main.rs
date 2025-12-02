@@ -17,11 +17,14 @@ const BPP: usize = 2; // bytes per pixel
 
 // Decibel thresholds - adjusted for real-world microphone input
 // Typical microphone input ranges from -90dB (silence) to -20dB (very loud)
+// Progression: Green (quiet) -> Yellow (medium) -> Red (loud) -> Flash (very loud)
 const MIN_DB: f32 = -80.0; // Minimum threshold (silence) - below this, lights off
 const MAX_DB: f32 = 0.0;   // Maximum threshold (loud)
-const MID_LOW: f32 = -60.0;  // Start transitioning to yellow (quiet sound)
-const MID_HIGH: f32 = -40.0; // Start transitioning to red (moderate sound)
-const FLASH_THRESHOLD: f32 = -20.0; // Threshold for flashing sequence (loud sound)
+const GREEN_FULL: f32 = -65.0;  // Full green reached (quiet sounds)
+const YELLOW_START: f32 = -55.0; // Start transitioning from green to yellow
+const YELLOW_MAX: f32 = -35.0;   // Maximum yellow (start transitioning to red)
+const RED_START: f32 = -35.0;    // Start transitioning from yellow to red
+const FLASH_THRESHOLD: f32 = -20.0; // Threshold for flashing sequence (very loud)
 
 // Flashing sequence duration
 const FLASH_DURATION: Duration = Duration::from_secs(5);
@@ -76,26 +79,31 @@ fn db_to_color(db: f32) -> (u8, u8, u8) {
         return (0, 0, 0);
     }
 
-    if db < MID_LOW {
-        // Low sound - fade in green
-        let ratio = (db - MIN_DB) / (MID_LOW - MIN_DB);
-        let green = (ratio * 255.0) as u8;
+    if db < GREEN_FULL {
+        // Very quiet sound - fade in green from black
+        let ratio = (db - MIN_DB) / (GREEN_FULL - MIN_DB);
+        let green = (ratio * 255.0).min(255.0) as u8;
         return (0, green, 0);
     }
 
-    if db < MID_HIGH {
-        // Mid sound - transition from green to yellow
-        let ratio = (db - MID_LOW) / (MID_HIGH - MID_LOW);
+    if db < YELLOW_START {
+        // Quiet sound - full green
+        return (0, 255, 0);
+    }
+
+    if db < YELLOW_MAX {
+        // Medium sound - transition from green to yellow
+        let ratio = (db - YELLOW_START) / (YELLOW_MAX - YELLOW_START);
         let green = 255;
-        let red = (ratio * 255.0) as u8;
+        let red = (ratio * 255.0).min(255.0) as u8;
         return (red, green, 0);
     }
 
     if db < FLASH_THRESHOLD {
-        // High sound - transition from yellow to red
-        let ratio = (db - MID_HIGH) / (FLASH_THRESHOLD - MID_HIGH);
+        // Loud sound - transition from yellow to red
+        let ratio = (db - RED_START) / (FLASH_THRESHOLD - RED_START);
         let red = 255;
-        let green = ((1.0 - ratio) * 255.0) as u8;
+        let green = ((1.0 - ratio) * 255.0).max(0.0) as u8;
         return (red, green, 0);
     }
 
@@ -243,7 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flash_cooldown = Duration::from_secs(1); // Cooldown after flashing
     let mut last_debug_time = Instant::now();
     
-    // Current displayed color (for smoothing)
+    // Current displayed color (for smoothing) - start with green for quiet sounds
     let mut current_color = (0u8, 0u8, 0u8);
 
     while running.load(Ordering::SeqCst) {
