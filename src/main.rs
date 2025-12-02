@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
+use rand::Rng;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 // LED matrix is 8x8, each pixel is 16 bits (RGB565)
 const WIDTH: usize = 8;
 const HEIGHT: usize = 8;
+const BPP: usize = 2; // bytes per pixel
 
 // Decibel thresholds - adjusted for real-world microphone input
 // Typical microphone input ranges from -90dB (silence) to -20dB (very loud)
@@ -102,17 +104,34 @@ fn db_to_color(db: f32) -> (u8, u8, u8) {
 }
 
 fn flashing_sequence(fb: &mut File, running: &Arc<AtomicBool>) -> std::io::Result<()> {
+    // Use the sparkles algorithm from main branch
     let start_time = Instant::now();
-    let mut is_white = false;
+    let mut rng = rand::rng();
 
     while running.load(Ordering::SeqCst) && start_time.elapsed() < FLASH_DURATION {
-        if is_white {
-            fill_fb(fb, (255, 255, 255))?; // White
-        } else {
-            fill_fb(fb, (255, 0, 0))?; // Red
-        }
-        is_white = !is_white;
-        thread::sleep(Duration::from_millis(100)); // Flash every 100ms
+        // Pick random x, y coordinate
+        let x = rng.random_range(0..WIDTH);
+        let y = rng.random_range(0..HEIGHT);
+
+        // Pick random RGB color
+        let r = rng.random_range(0..=255);
+        let g = rng.random_range(0..=255);
+        let b = rng.random_range(0..=255);
+
+        // Convert RGB888 -> RGB565 (Sense HAT format)
+        let r5 = (r >> 3) as u16;
+        let g6 = (g >> 2) as u16;
+        let b5 = (b >> 3) as u16;
+
+        let pixel: u16 = (r5 << 11) | (g6 << 5) | b5;
+
+        // Framebuffer offset formula: offset = (y * width + x) * bytes_per_pixel
+        let offset = ((y * WIDTH) + x) * BPP;
+
+        fb.seek(SeekFrom::Start(offset as u64))?;
+        fb.write_all(&pixel.to_le_bytes())?;
+
+        thread::sleep(Duration::from_millis(1)); // Same timing as main branch
     }
 
     Ok(())
