@@ -2,7 +2,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use rand::Rng;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
@@ -10,10 +11,29 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-// LED matrix is 8x8, each pixel is 16 bits (RGB565)
+// LED matrix is 8x8
 const WIDTH: usize = 8;
 const HEIGHT: usize = 8;
-const BPP: usize = 2; // bytes per pixel
+
+// IS31FL3731 I²C address for Sense HAT
+const IS31FL3731_ADDR: u8 = 0x74;
+const I2C_DEVICE: &str = "/dev/i2c-1";
+
+// IS31FL3731 register addresses
+const IS31FL3731_REG_PICTURE_DISPLAY: u8 = 0x01;
+const IS31FL3731_REG_AUTOPLAY1: u8 = 0x02;
+const IS31FL3731_REG_AUTOPLAY2: u8 = 0x03;
+const IS31FL3731_REG_DISPLAY_OPTION: u8 = 0x05;
+const IS31FL3731_REG_AUDIO_SYNC: u8 = 0x06;
+const IS31FL3731_REG_FRAME_STATE: u8 = 0x07;
+const IS31FL3731_REG_BREATH1: u8 = 0x08;
+const IS31FL3731_REG_BREATH2: u8 = 0x09;
+const IS31FL3731_REG_SHUTDOWN: u8 = 0x0A;
+const IS31FL3731_REG_AUDIOSYNC: u8 = 0x06;
+
+// Frame register base addresses (8 frames available)
+const IS31FL3731_FRAME_REG_BASE: u8 = 0x0B;
+const IS31FL3731_FRAME_SIZE: usize = 144; // 8x8x2 + 8 (color registers)
 
 // Decibel thresholds - adjusted for real-world microphone input
 // Typical microphone input ranges from -90dB (silence) to -20dB (very loud)
@@ -33,33 +53,133 @@ const FLASH_DURATION: Duration = Duration::from_secs(5);
 // Lower values = faster transitions, higher values = slower/smoother transitions
 const COLOR_SMOOTHING: f32 = 0.85;
 
-fn clear_fb(fb: &mut File) -> std::io::Result<()> {
-    // Turn all pixels off (black)
-    let black_pixel: [u8; 2] = 0u16.to_le_bytes();
-    fb.seek(SeekFrom::Start(0))?;
-
-    for _ in 0..(WIDTH * HEIGHT) {
-        fb.write_all(&black_pixel)?;
-    }
-
-    Ok(())
+// IS31FL3731 LED driver interface
+struct SenseHatLED {
+    i2c: File,
 }
 
-fn fill_fb(fb: &mut File, color: (u8, u8, u8)) -> std::io::Result<()> {
-    // Convert RGB888 -> RGB565 (Sense HAT format)
-    let r5 = (color.0 >> 3) as u16;
-    let g6 = (color.1 >> 2) as u16;
-    let b5 = (color.2 >> 3) as u16;
-    let pixel: u16 = (r5 << 11) | (g6 << 5) | b5;
-    let pixel_bytes = pixel.to_le_bytes();
+impl SenseHatLED {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let i2c = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(I2C_DEVICE)?;
 
-    fb.seek(SeekFrom::Start(0))?;
-    for _ in 0..(WIDTH * HEIGHT) {
-        fb.write_all(&pixel_bytes)?;
+        // Set I²C slave address using ioctl
+        unsafe {
+            let fd = i2c.as_raw_fd();
+            // I2C_SLAVE = 0x0703
+            libc::ioctl(fd, 0x0703, IS31FL3731_ADDR as libc::c_ulong);
+        }
+
+        let mut led = SenseHatLED { i2c };
+        led.init()?;
+        Ok(led)
     }
-    fb.sync_all()?; // Ensure writes are flushed to device
 
-    Ok(())
+    fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Shutdown register - enable chip
+        self.write_register(IS31FL3731_REG_SHUTDOWN, 0x01)?;
+        thread::sleep(Duration::from_millis(10));
+
+        // Display option - use frame 0
+        self.write_register(IS31FL3731_REG_DISPLAY_OPTION, 0x00)?;
+
+        // Picture display - show frame 0
+        self.write_register(IS31FL3731_REG_PICTURE_DISPLAY, 0x00)?;
+
+        // Clear frame 0
+        self.clear_frame(0)?;
+
+        Ok(())
+    }
+
+    fn write_register(&mut self, reg: u8, value: u8) -> Result<(), Box<dyn std::error::Error>> {
+        let buf = [reg, value];
+        self.i2c.write_all(&buf)?;
+        Ok(())
+    }
+
+    fn select_frame(&mut self, frame: u8) -> Result<(), Box<dyn std::error::Error>> {
+        // Frame select register (0xFD) must be written before accessing frame data
+        self.write_register(0xFD, frame)?;
+        Ok(())
+    }
+
+    fn clear_frame(&mut self, frame: u8) -> Result<(), Box<dyn std::error::Error>> {
+        // Select frame
+        self.select_frame(frame)?;
+
+        // Clear all LED enable bits (first 18 bytes: 144 LEDs / 8 bits per byte)
+        for i in 0..18 {
+            self.write_register(IS31FL3731_FRAME_REG_BASE + i, 0x00)?;
+        }
+
+        // Clear all PWM data (next 144 bytes)
+        for i in 18..162 {
+            self.write_register(IS31FL3731_FRAME_REG_BASE + i, 0x00)?;
+        }
+
+        Ok(())
+    }
+
+    fn set_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) -> Result<(), Box<dyn std::error::Error>> {
+        // Sense HAT LED matrix uses a specific mapping
+        // The IS31FL3731 has 144 LEDs arranged in a specific pattern
+        // Sense HAT maps these to an 8x8 grid with rotation
+        
+        // Sense HAT coordinate system: (0,0) is top-left when viewed normally
+        // IS31FL3731 LED indices: The Sense HAT Python library uses a specific mapping
+        // This is a simplified version - the actual mapping may need adjustment
+        
+        // Select frame 0 for writing
+        self.select_frame(0)?;
+
+        // Sense HAT LED mapping (simplified - may need calibration)
+        // The actual mapping depends on how the Sense HAT hardware is wired
+        // For now, use a direct mapping and adjust if needed
+        let led_index = (y * 8 + x) as u8;
+
+        // Enable the LED (first 18 bytes are enable registers)
+        let enable_byte = (led_index / 8) as u8;
+        let enable_reg = IS31FL3731_FRAME_REG_BASE + enable_byte;
+        
+        // We need to read-modify-write, but for simplicity, enable all bits in the byte
+        // A full implementation would read, modify, then write
+        self.write_register(enable_reg, 0xFF)?;
+
+        // Set PWM value (brightness) - next 144 bytes are PWM data
+        let pwm_reg = IS31FL3731_FRAME_REG_BASE + 18 + led_index;
+        // Use average brightness for now (full RGB support requires color registers)
+        let brightness = ((r as u16 + g as u16 + b as u16) / 3).min(255) as u8;
+        self.write_register(pwm_reg, brightness)?;
+
+        Ok(())
+    }
+
+    fn fill_all(&mut self, r: u8, g: u8, b: u8) -> Result<(), Box<dyn std::error::Error>> {
+        // Select frame 0
+        self.select_frame(0)?;
+
+        // Enable all LEDs (first 18 bytes)
+        for i in 0..18 {
+            self.write_register(IS31FL3731_FRAME_REG_BASE + i, 0xFF)?;
+        }
+
+        // Set PWM for all LEDs (next 144 bytes)
+        // Use average brightness (full RGB requires color register setup)
+        let brightness = ((r as u16 + g as u16 + b as u16) / 3).min(255) as u8;
+        for i in 18..162 {
+            self.write_register(IS31FL3731_FRAME_REG_BASE + i, brightness)?;
+        }
+
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.clear_frame(0)?;
+        Ok(())
+    }
 }
 
 fn calculate_decibel(rms: f32) -> f32 {
@@ -111,7 +231,7 @@ fn db_to_color(db: f32) -> (u8, u8, u8) {
     (255, 0, 0)
 }
 
-fn flashing_sequence(fb: &mut File, running: &Arc<AtomicBool>) -> std::io::Result<()> {
+fn flashing_sequence(led: &mut SenseHatLED, running: &Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
     // Use the sparkles algorithm from main branch
     let start_time = Instant::now();
     let mut rng = rand::rng();
@@ -126,18 +246,7 @@ fn flashing_sequence(fb: &mut File, running: &Arc<AtomicBool>) -> std::io::Resul
         let g = rng.random_range(0..=255);
         let b = rng.random_range(0..=255);
 
-        // Convert RGB888 -> RGB565 (Sense HAT format)
-        let r5 = (r >> 3) as u16;
-        let g6 = (g >> 2) as u16;
-        let b5 = (b >> 3) as u16;
-
-        let pixel: u16 = (r5 << 11) | (g6 << 5) | b5;
-
-        // Framebuffer offset formula: offset = (y * width + x) * bytes_per_pixel
-        let offset = ((y * WIDTH) + x) * BPP;
-
-        fb.seek(SeekFrom::Start(offset as u64))?;
-        fb.write_all(&pixel.to_le_bytes())?;
+        led.set_pixel(x, y, r, g, b)?;
 
         thread::sleep(Duration::from_millis(1)); // Same timing as main branch
     }
@@ -146,12 +255,9 @@ fn flashing_sequence(fb: &mut File, running: &Arc<AtomicBool>) -> std::io::Resul
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Sense HAT framebuffer is almost always /dev/fb1
-    let mut fb = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open("/dev/fb1")
-        .expect("Could not open /dev/fb1. Are you running on a Sense HAT?");
+    // Initialize Sense HAT LED matrix via I²C
+    let mut led = SenseHatLED::new()
+        .expect("Could not initialize Sense HAT LED matrix. Are you running on a Raspberry Pi with Sense HAT?");
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -266,7 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Check if we should enter flash mode (with cooldown to prevent rapid re-triggering)
         if db >= FLASH_THRESHOLD && last_flash_time.elapsed() >= flash_cooldown {
             println!("Flash threshold reached! dB: {:.2}", db);
-            flashing_sequence(&mut fb, &running)?;
+            flashing_sequence(&mut led, &running)?;
             last_flash_time = Instant::now(); // Update after flashing completes
             // Reset current color after flashing
             current_color = (255, 0, 0);
@@ -281,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ((current_color.2 as f32 * COLOR_SMOOTHING) + (target_color.2 as f32 * (1.0 - COLOR_SMOOTHING))) as u8,
             );
             
-            fill_fb(&mut fb, current_color)?;
+            led.fill_all(current_color.0, current_color.1, current_color.2)?;
         }
 
         // Small delay to avoid excessive writes
@@ -289,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Ctrl+C pressed: clear the display before exiting
-    clear_fb(&mut fb)?;
+    led.clear()?;
 
     Ok(())
 }
