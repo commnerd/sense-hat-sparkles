@@ -16,7 +16,10 @@ const WIDTH: usize = 8;
 const HEIGHT: usize = 8;
 
 // IS31FL3731 I²C address for Sense HAT
-const IS31FL3731_ADDR: u8 = 0x74;
+// The Sense HAT LED driver is typically at 0x46, but can also be at 0x74
+// Try both addresses if one fails
+const IS31FL3731_ADDR_PRIMARY: u8 = 0x46;
+const IS31FL3731_ADDR_SECONDARY: u8 = 0x74;
 const I2C_DEVICE: &str = "/dev/i2c-1";
 
 // IS31FL3731 register addresses
@@ -56,47 +59,101 @@ const COLOR_SMOOTHING: f32 = 0.85;
 // IS31FL3731 LED driver interface
 struct SenseHatLED {
     i2c: File,
+    address: u8,
 }
 
 impl SenseHatLED {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let i2c = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(I2C_DEVICE)?;
-
-        // Set I²C slave address using ioctl
-        unsafe {
-            let fd = i2c.as_raw_fd();
-            // I2C_SLAVE = 0x0703
-            libc::ioctl(fd, 0x0703, IS31FL3731_ADDR as libc::c_ulong);
+        // Check if I²C device exists
+        if !std::path::Path::new(I2C_DEVICE).exists() {
+            return Err(format!("I²C device {} not found. Is I²C enabled?", I2C_DEVICE).into());
         }
 
-        let mut led = SenseHatLED { i2c };
-        led.init()?;
-        Ok(led)
+        // Try primary address first (0x46), then secondary (0x74)
+        let addresses = [IS31FL3731_ADDR_PRIMARY, IS31FL3731_ADDR_SECONDARY];
+        let mut last_error = None;
+
+        for &addr in &addresses {
+            let i2c = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(I2C_DEVICE)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    last_error = Some(format!("Failed to open {}: {}", I2C_DEVICE, e));
+                    continue;
+                }
+            };
+
+            // Set I²C slave address using ioctl
+            let ioctl_result = unsafe {
+                let fd = i2c.as_raw_fd();
+                // I2C_SLAVE = 0x0703
+                libc::ioctl(fd, 0x0703, addr as libc::c_ulong)
+            };
+
+            if ioctl_result < 0 {
+                last_error = Some(format!(
+                    "Failed to set I²C slave address 0x{:02X}: {}",
+                    addr,
+                    std::io::Error::last_os_error()
+                ));
+                continue;
+            }
+
+            // Try to initialize - if this works, we found the right address
+            let mut led = SenseHatLED { i2c, address: addr };
+            match led.init() {
+                Ok(_) => {
+                    println!("Successfully initialized Sense HAT LED at I²C address 0x{:02X}", addr);
+                    return Ok(led);
+                }
+                Err(e) => {
+                    last_error = Some(format!("Initialization failed at 0x{:02X}: {}", addr, e));
+                    continue;
+                }
+            }
+        }
+
+        // If we get here, both addresses failed
+        Err(format!(
+            "Failed to initialize Sense HAT LED matrix. Tried addresses 0x{:02X} and 0x{:02X}.\nLast error: {}\n\nTroubleshooting:\n- Ensure I²C is enabled: sudo raspi-config\n- Check device exists: ls -l {}\n- Verify permissions: sudo usermod -a -G i2c $USER\n- Check if Sense HAT is connected: i2cdetect -y 1",
+            IS31FL3731_ADDR_PRIMARY,
+            IS31FL3731_ADDR_SECONDARY,
+            last_error.unwrap_or_else(|| "Unknown error".to_string()),
+            I2C_DEVICE
+        ).into())
     }
 
     fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Shutdown register - enable chip
-        self.write_register(IS31FL3731_REG_SHUTDOWN, 0x01)?;
+        // Shutdown register - enable chip (0x01 = normal operation, 0x00 = shutdown)
+        self.write_register(IS31FL3731_REG_SHUTDOWN, 0x01)
+            .map_err(|e| format!("Failed to write shutdown register: {}", e))?;
         thread::sleep(Duration::from_millis(10));
 
         // Display option - use frame 0
-        self.write_register(IS31FL3731_REG_DISPLAY_OPTION, 0x00)?;
+        self.write_register(IS31FL3731_REG_DISPLAY_OPTION, 0x00)
+            .map_err(|e| format!("Failed to write display option register: {}", e))?;
 
         // Picture display - show frame 0
-        self.write_register(IS31FL3731_REG_PICTURE_DISPLAY, 0x00)?;
+        self.write_register(IS31FL3731_REG_PICTURE_DISPLAY, 0x00)
+            .map_err(|e| format!("Failed to write picture display register: {}", e))?;
 
         // Clear frame 0
-        self.clear_frame(0)?;
+        self.clear_frame(0)
+            .map_err(|e| format!("Failed to clear frame: {}", e))?;
 
         Ok(())
     }
 
     fn write_register(&mut self, reg: u8, value: u8) -> Result<(), Box<dyn std::error::Error>> {
+        // I²C write: first byte is register address, second byte is value
         let buf = [reg, value];
-        self.i2c.write_all(&buf)?;
+        self.i2c.write_all(&buf)
+            .map_err(|e| format!("I²C write failed (reg: 0x{:02X}, val: 0x{:02X}): {}", reg, value, e))?;
+        // Small delay to ensure write completes
+        thread::sleep(Duration::from_micros(100));
         Ok(())
     }
 
@@ -257,7 +314,7 @@ fn flashing_sequence(led: &mut SenseHatLED, running: &Arc<AtomicBool>) -> Result
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Sense HAT LED matrix via I²C
     let mut led = SenseHatLED::new()
-        .expect("Could not initialize Sense HAT LED matrix. Are you running on a Raspberry Pi with Sense HAT?");
+        .map_err(|e| format!("Could not initialize Sense HAT LED matrix: {}\n\nTroubleshooting:\n- Ensure I²C is enabled: sudo raspi-config\n- Check device exists: ls -l {}\n- Verify permissions: sudo usermod -a -G i2c $USER\n- Check if Sense HAT is connected: i2cdetect -y 1", e, I2C_DEVICE))?;
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
